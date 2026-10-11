@@ -368,6 +368,9 @@ class QAMModulator {
   /** True when there are no pending bits (idle marking). */
   get idle() { return this._bitQueue.length === 0; }
 
+  /** Queued user bytes not yet transmitted (11-bit UART frames). */
+  get pendingBytes() { return Math.ceil(this._bitQueue.length / 11); }
+
   /**
    * Change the bits-per-symbol during operation. Used by V.22bis handshake
    * to start at 1200 bps (2 bits/symbol) and later switch to 2400 bps
@@ -859,6 +862,7 @@ class V22 extends EventEmitter {
   get ready()          { return this._phase === V22_HS_PHASE.DATA; }
   get remoteDetected() { return this._remoteDetected; }
   get rxEnergy()       { return this.demodulator.symbolMag; }
+  get txBacklogBytes() { return this.modulator.pendingBytes; }
 }
 
 // ─── V.22bis handshake ─────────────────────────────────────────────────────
@@ -1585,6 +1589,7 @@ class V22bis extends EventEmitter {
   get ready()          { return this._phase === HS_PHASE.DATA; }
   get remoteDetected() { return this._remoteDetected; }
   get rxEnergy()       { return this.demodulator.symbolMag; }
+  get txBacklogBytes() { return this.modulator.pendingBytes; }
 }
 
 module.exports = {

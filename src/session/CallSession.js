@@ -32,6 +32,10 @@ const { TelnetProxy }           = require('../telnet/TelnetProxy');
 const { PppDetector }           = require('../ppp/PppDetector');
 const { PppBridge }             = require('../ppp/PppBridge');
 const { natManager }            = require('../ppp/NatManager');
+const { DnsResponder }          = require('../ppp/DnsResponder');
+const { WebGateway }            = require('../ppp/WebGateway');
+const { Pop3Stub }              = require('../ppp/Pop3Stub');
+const { PppTxShaper }           = require('../ppp/PppTxShaper');
 const { AudioCapture }          = require('../dsp/AudioCapture');
 
 const log = makeLogger('CallSession');
@@ -715,10 +719,16 @@ class CallSession extends EventEmitter {
 
       const bridge = new PppBridge(pppCfg, { tag: this._id });
       this._ppp = bridge;
-      bridge.on('data', buf => {
-        if (!this._dsp) return;
-        try { this._dsp.write(buf); } catch (_) { /* racing teardown */ }
+      // pppd → modem through a short, bounded queue (see PppTxShaper).
+      const shaper = new PppTxShaper({
+        limitBytes: pppCfg.txQueueBytes ?? 600,
+        backlog: () => (this._dsp && this._dsp.txBacklogBytes) || 0,
+        write: buf => {
+          if (!this._dsp) return;
+          try { this._dsp.write(buf); } catch (_) { /* racing teardown */ }
+        },
       });
+      bridge.on('data', buf => shaper.push(buf));
       bridge.on('error', err => {
         log.error(`[${this._id}] PPP bridge error: ${err.message}`);
         this.hangup('ppp-error');
@@ -732,8 +742,34 @@ class CallSession extends EventEmitter {
         natManager.acquire({ subnet, interface: nat.interface || 'auto' });
         natHeld = true;   // release even if setup failed; acquire counted it
       });
+      // DNS + web gateway on the PPP address: lets the caller browse
+      // without any routing (see DnsResponder / WebGateway).
+      let dnsResponder = null, webGateway = null, pop3Stub = null;
+      bridge.on('ip-up', () => {
+        const gw = pppCfg.gateway || {};
+        if (!gw.enabled || dnsResponder) return;
+        dnsResponder = new DnsResponder({
+          bindIp: pppCfg.localIp, port: gw.dnsPort ?? 53,
+          answerIp: pppCfg.localIp, overrides: gw.dnsOverrides || {},
+        });
+        webGateway = new WebGateway({
+          bindIp: pppCfg.localIp, port: gw.httpPort ?? 80,
+          allowedClients: [pppCfg.remoteIp], localHosts: gw.localHosts || [],
+          maxPageBytes: gw.maxPageBytes, maxImageBytes: gw.maxImageBytes, timeoutMs: gw.timeoutMs,
+        });
+        pop3Stub = gw.pop3Port === null ? null : new Pop3Stub({
+          bindIp: pppCfg.localIp, port: gw.pop3Port ?? 110, allowedClients: [pppCfg.remoteIp],
+        });
+        this._gateway = { dnsResponder, webGateway, pop3Stub };
+        dnsResponder.start().catch(err => log.warn(`[${this._id}] DNS responder not started: ${err.message}`));
+        webGateway.start().catch(err => log.warn(`[${this._id}] Web gateway not started: ${err.message}`));
+        if (pop3Stub) pop3Stub.start().catch(err => log.warn(`[${this._id}] POP3 stub not started: ${err.message}`));
+      });
       bridge.on('exit', () => {
         if (natHeld) { natHeld = false; natManager.release(); }
+        if (dnsResponder) { dnsResponder.stop(); dnsResponder = null; }
+        if (webGateway) { webGateway.stop(); webGateway = null; }
+        if (pop3Stub) { pop3Stub.stop(); pop3Stub = null; }
         if (this._active) this.hangup('ppp-exit');
       });
       bridge.start();

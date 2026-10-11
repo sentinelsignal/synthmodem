@@ -42,6 +42,11 @@ function buildPppdArgs(cfg, { logFile, tag } = {}) {
     'noacsp',            // Apple's ACSCP extension; callers reject it
     `${cfg.localIp}:${cfg.remoteIp}`,
   ];
+  // Small packets for a slow link: a 1500-byte packet takes ~13 s at
+  // 1200 bit/s, far beyond TCP's retransmit timer.
+  if (cfg.mtu) args.push('mtu', String(cfg.mtu), 'mru', String(cfg.mtu));
+  // VJ header compression can't survive PppTxShaper dropping frames.
+  if (cfg.vj === false) args.push('novj');
   for (const dns of cfg.dns || []) args.push('ms-dns', dns);
   if (cfg.debug) args.push('debug');
   if (logFile) args.push('logfile', logFile);

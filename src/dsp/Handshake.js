@@ -840,6 +840,8 @@ class HandshakeEngine extends EventEmitter {
   get state()    { return this._state; }
   get protocol() { return this._protocolName; }
   get isData()   { return this._state === HS_STATE.DATA; }
+  /** Bytes queued for transmission (0 for protocols that don't report it). */
+  get txBacklogBytes() { return (this._protocol && this._protocol.txBacklogBytes) || 0; }
 }
 
 module.exports = { HandshakeEngine, PROTOCOLS, FskDiscriminator };

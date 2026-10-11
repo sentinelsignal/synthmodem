@@ -175,6 +175,7 @@ class ModemDSP extends EventEmitter {
 
   get connected()    { return this._connected; }
   get handshakeState() { return this._handshake.state; }
+  get txBacklogBytes() { return this._handshake.txBacklogBytes; }
   get protocol()     { return this._handshake.protocol; }
 }
 
