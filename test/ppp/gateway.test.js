@@ -321,7 +321,9 @@ test('session: IP link up starts DNS + gateway on the PPP address; pppd exit sto
     sess._onModemConnected();
     sess._dsp.emit('data', LCP);
     sess._ppp.emit('ip-up', { iface: 'lo0' });
-    const { dnsResponder, webGateway, pop3Stub } = sess._gateway;
+    const { dnsResponder, webGateway, pop3Stub, pacer } = sess._gateway;
+    assert.ok(pacer, 'per-call LinkPacer created');
+    assert.equal(webGateway._pacer, pacer, 'gateway responses go through it');
     const end = Date.now() + 2000;
     while ((!dnsResponder.port || !webGateway.port || !pop3Stub.port) && Date.now() < end) await new Promise(r => setTimeout(r, 10));
     assert.ok(pop3Stub.port, 'POP3 stub listening');
@@ -335,6 +337,8 @@ test('session: IP link up starts DNS + gateway on the PPP address; pppd exit sto
     assert.equal(dnsResponder.port, null);
     assert.equal(webGateway.port, null);
     assert.equal(pop3Stub.port, null);
+    assert.equal(pacer._stopped, true, 'pacer stopped with the call');
+    assert.equal(pacer.active, 0);
   } finally {
     if (sess._active) sess.hangup('cleanup');
     if (sess._ppp) sess._ppp.stop();

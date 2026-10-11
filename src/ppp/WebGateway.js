@@ -155,6 +155,7 @@ class WebGateway extends EventEmitter {
    * @param {number}   [opts.timeoutMs=15000]
    * @param {function} [opts.checkTarget]    async (hostname) → throws if blocked (tests)
    * @param {function} [opts.fetchImpl]      fetch stand-in (tests)
+   * @param {LinkPacer} [opts.pacer]         deliver responses at link pace
    */
   constructor(opts) {
     super();
@@ -163,6 +164,7 @@ class WebGateway extends EventEmitter {
     for (const [k, v] of Object.entries(opts)) if (v !== undefined) this._opts[k] = v;
     this._checkTarget = opts.checkTarget || defaultCheckTarget;
     this._fetch = opts.fetchImpl || fetch;
+    this._pacer = opts.pacer || null;
     this._server = null;
   }
 
@@ -196,7 +198,10 @@ class WebGateway extends EventEmitter {
   _send(res, status, type, body) {
     if (res.headersSent) return res.end();
     res.writeHead(status, { 'Content-Type': type, 'Content-Length': body.length, Connection: 'close' });
-    res.end(body);
+    // Paced: written at the modem link's rate (see LinkPacer). Unpaced
+    // (no pacer configured, e.g. tests): written at once.
+    if (this._pacer) this._pacer.send(res, body);
+    else res.end(body);
   }
 
   /** Work out the requested URL from an absolute URI or the Host header. */

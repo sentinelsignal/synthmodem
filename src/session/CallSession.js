@@ -36,6 +36,7 @@ const { DnsResponder }          = require('../ppp/DnsResponder');
 const { WebGateway }            = require('../ppp/WebGateway');
 const { Pop3Stub }              = require('../ppp/Pop3Stub');
 const { PppTxShaper }           = require('../ppp/PppTxShaper');
+const { LinkPacer }             = require('../ppp/LinkPacer');
 const { AudioCapture }          = require('../dsp/AudioCapture');
 
 const log = makeLogger('CallSession');
@@ -744,10 +745,18 @@ class CallSession extends EventEmitter {
       });
       // DNS + web gateway on the PPP address: lets the caller browse
       // without any routing (see DnsResponder / WebGateway).
-      let dnsResponder = null, webGateway = null, pop3Stub = null;
+      let dnsResponder = null, webGateway = null, pop3Stub = null, pacer = null;
       bridge.on('ip-up', () => {
         const gw = pppCfg.gateway || {};
         if (!gw.enabled || dnsResponder) return;
+        // Pace gateway responses to the negotiated modem rate.
+        if (gw.pacing !== false) {
+          pacer = new LinkPacer({
+            backlog: () => (this._dsp && this._dsp.txBacklogBytes) || 0,
+            bps: () => (this._connectInfo && this._connectInfo.bps) || 1200,
+            mtu: pppCfg.mtu || 296,
+          });
+        }
         dnsResponder = new DnsResponder({
           bindIp: pppCfg.localIp, port: gw.dnsPort ?? 53,
           answerIp: pppCfg.localIp, overrides: gw.dnsOverrides || {},
@@ -756,11 +765,12 @@ class CallSession extends EventEmitter {
           bindIp: pppCfg.localIp, port: gw.httpPort ?? 80,
           allowedClients: [pppCfg.remoteIp], localHosts: gw.localHosts || [],
           maxPageBytes: gw.maxPageBytes, maxImageBytes: gw.maxImageBytes, timeoutMs: gw.timeoutMs,
+          pacer,
         });
         pop3Stub = gw.pop3Port === null ? null : new Pop3Stub({
           bindIp: pppCfg.localIp, port: gw.pop3Port ?? 110, allowedClients: [pppCfg.remoteIp],
         });
-        this._gateway = { dnsResponder, webGateway, pop3Stub };
+        this._gateway = { dnsResponder, webGateway, pop3Stub, pacer };
         dnsResponder.start().catch(err => log.warn(`[${this._id}] DNS responder not started: ${err.message}`));
         webGateway.start().catch(err => log.warn(`[${this._id}] Web gateway not started: ${err.message}`));
         if (pop3Stub) pop3Stub.start().catch(err => log.warn(`[${this._id}] POP3 stub not started: ${err.message}`));
@@ -770,6 +780,7 @@ class CallSession extends EventEmitter {
         if (dnsResponder) { dnsResponder.stop(); dnsResponder = null; }
         if (webGateway) { webGateway.stop(); webGateway = null; }
         if (pop3Stub) { pop3Stub.stop(); pop3Stub = null; }
+        if (pacer) { pacer.stop(); pacer = null; }
         if (this._active) this.hangup('ppp-exit');
       });
       bridge.start();
