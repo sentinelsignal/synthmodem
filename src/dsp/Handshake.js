@@ -628,6 +628,12 @@ class HandshakeEngine extends EventEmitter {
         this._protocol.on('remote-detected', info => {
           log.info(`${name} remote carrier detected (rx RMS=${info.rms.toFixed(3)})`);
         });
+        const demod = this._protocol.demodulator;
+        if (demod && demod.on) {
+          demod.on('agc-reacquire', info => {
+            log.info(`${name} RX level rose ${info.riseDb.toFixed(1)} dB after AGC lock — re-acquiring (#${info.count})`);
+          });
+        }
       }
       this._protocol.once('ready', info => {
         // If the protocol supports remote detection and no remote carrier

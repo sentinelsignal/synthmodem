@@ -149,6 +149,28 @@ const AGC_SCALING_NUMERATOR = 0.18 * 3.60;
 // line 1029: `s->rx.agc_scaling = 0.0005f * 0.025f`)
 const AGC_INITIAL_SCALING = 0.0005 * 0.025;
 
+// AGC re-acquisition (deviation from spandsp). The AGC is one-shot: it is
+// set during SYMBOL_ACQUISITION and locked thereafter. Some callers start
+// with a short weak burst and then ramp up — a real Dreamcast capture
+// (2026-10-11) shows a ~100 ms burst ~19 dB below the steady signal, then
+// a ~20 dB ramp over ~200 ms. Locking on the burst leaves the AGC ~18 dB
+// too hot, the equalizer collapses onto one constellation point, and the
+// descrambler emits 0x55 at line rate. If the smoothed power rises by
+// AGC_REACQUIRE_DB above the level at lock, before the first
+// NORMAL_OPERATION, we restart SYMBOL_ACQUISITION so the AGC is recomputed
+// from the stronger signal.
+//
+// The comparison uses a ~16 ms average (alpha 1/128) rather than the AGC's
+// fast meter: on clean V.22 the fast meter ripples 4-5.4 dB peak-to-peak,
+// the slow average 1.7-2.1 dB, so 6 dB leaves margin against false
+// restarts. MAX restarts covers a 20 dB ramp in 6 dB steps; the window
+// bounds the check to just after lock. Set SYNTHMODEM_V22_AGC_REACQUIRE=0
+// (or pass agcReacquireDb: 0) to restore the original behaviour.
+const AGC_REACQUIRE_DB        = 6;
+const AGC_REACQUIRE_MAX       = 4;
+const AGC_REACQUIRE_WINDOW_MS = 1000;
+const AGC_SLOW_POWER_ALPHA    = 1 / 128;
+
 // Carrier-tracking PI loop constants. Spandsp uses int32 phase units where
 // 2^32 = one cycle, with track_p/track_i in those units. Our NCO uses
 // floating-point phase in radians (0..2π). Convert by 2π/2^32 ≈ 1.4628e-9.
@@ -229,6 +251,16 @@ const RX_TRAINING = {
   PARKED:                               8,
 };
 
+// Training stages in which AGC re-acquisition may restart acquisition.
+// Excludes WAIT_FOR_SCRAMBLED_ONES_AT_2400 (16-way slicing already on),
+// NORMAL_OPERATION and PARKED.
+const REACQUIRE_STAGES = new Set([
+  RX_TRAINING.UNSCRAMBLED_ONES,
+  RX_TRAINING.UNSCRAMBLED_ONES_SUSTAINING,
+  RX_TRAINING.SCRAMBLED_ONES_AT_1200,
+  RX_TRAINING.SCRAMBLED_ONES_AT_1200_SUSTAINING,
+]);
+
 // Convert milliseconds → V.22 symbols (600 baud). Mirrors spandsp's
 // `ms_to_symbols(t)` macro (= t * 600 / 1000).
 function msToSymbols(ms) { return Math.floor((ms * BAUD) / 1000); }
@@ -270,6 +302,7 @@ class QAMDemodulator extends EventEmitter {
                               // V.22.
     enableCarrierGate = true,
     debugSink = null,
+    agcReacquireDb = process.env.SYNTHMODEM_V22_AGC_REACQUIRE === '0' ? 0 : AGC_REACQUIRE_DB,
   }) {
     super();
 
@@ -371,6 +404,15 @@ class QAMDemodulator extends EventEmitter {
     // in V22.js is calibrated to this scale.
     this._symbolMagSmoothed = 0;
 
+    // AGC re-acquisition state (see AGC_REACQUIRE_DB). A ratio of 0
+    // disables the feature.
+    this._agcReacquireRatio = agcReacquireDb > 0 ? Math.pow(10, agcReacquireDb / 10) : 0;
+    this._slowPower       = 0;
+    this._agcLockPower    = 0;      // slow power when the AGC last locked; 0 = not locked
+    this._agcLockSample   = 0;
+    this._agcReacquires   = 0;
+    this._reachedNormal   = false;
+
     // Initial equalizer coefficients
     this._equalizerCoefficientReset();
   }
@@ -380,6 +422,8 @@ class QAMDemodulator extends EventEmitter {
   get gatedBytes()    { return this._gatedBytes; }
   get trainingStage() { return this._training; }
   get totalSamples()  { return this._totalSamples; }
+  get agcScaling()    { return this._agcScaling; }
+  get agcReacquires() { return this._agcReacquires; }
   /** Smoothed RMS-ish magnitude of the post-RRC complex carrier signal,
    *  in normalized-audio units. Calibrated to match the prior demodulator's
    *  `symbolMag` scale (~0.05-0.15 on real V.22 signal); the V22 protocol
@@ -418,7 +462,46 @@ class QAMDemodulator extends EventEmitter {
     this._uartBits      = [];
     this._uartCount     = 0;
     this._symbolMagSmoothed = 0;
+    this._slowPower     = 0;
+    this._resetAgcReacquire();
     this._equalizerCoefficientReset();
+  }
+
+  /** Start a fresh AGC re-acquisition epoch (new carrier / hard reset). */
+  _resetAgcReacquire() {
+    this._agcLockPower  = 0;
+    this._agcLockSample = 0;
+    this._agcReacquires = 0;
+    this._reachedNormal = false;
+  }
+
+  /**
+   * Restart SYMBOL_ACQUISITION so the AGC is recomputed from the current
+   * (stronger) signal. Keeps symbol-timing position, carrier phase,
+   * descrambler and the negotiated bit rate; resets the stage-dependent
+   * loops the same way a carrier-down restart does.
+   */
+  _restartAcquisition() {
+    const fromPower = this._agcLockPower;
+    this._agcReacquires++;
+    this._agcLockPower = 0;
+    this._training = RX_TRAINING.SYMBOL_ACQUISITION;
+    this._trainingCount = 0;
+    this._patternRepeats = 0;
+    this._lastRawBits = 0;
+    this._sixteenWayDecisions = false;
+    this._gardnerIntegrate = 0;
+    this._gardnerStep = GARDNER_STEP_INITIAL;
+    this._carrierPhaseRate = this._carrierBaseRate;
+    this._carrierTrackI = this._callingParty ? CARRIER_TRACK_I_CALLER : CARRIER_TRACK_I_ANSWERER;
+    this._equalizerCoefficientReset();
+    const info = {
+      count:   this._agcReacquires,
+      riseDb:  10 * Math.log10(this._slowPower / fromPower),
+      t:       this._totalSamples / SR,
+    };
+    this.emit('agc-reacquire', info);
+    if (this._debugSink) this._debugSink({ type: 'agc_reacquire', ...info });
   }
 
   /** Reset only the equalizer coefficients (used on retrain).
@@ -683,6 +766,9 @@ class QAMDemodulator extends EventEmitter {
         if (++this._trainingCount >= 40) {
           this._gardnerStep = GARDNER_STEP_NORMAL;
           this._patternRepeats = 0;
+          // AGC locks here; remember the level for re-acquisition.
+          this._agcLockPower  = this._slowPower;
+          this._agcLockSample = this._totalSamples;
           this._training = this._callingParty
             ? RX_TRAINING.UNSCRAMBLED_ONES
             : RX_TRAINING.SCRAMBLED_ONES_AT_1200;
@@ -843,6 +929,7 @@ class QAMDemodulator extends EventEmitter {
     }
 
     this._lastRawBits = rawBits;
+    if (this._training === RX_TRAINING.NORMAL_OPERATION) this._reachedNormal = true;
 
     // Emit transition events for the V22bis sequencer (no-op for
     // V.22 which doesn't subscribe). Three signals matter:
@@ -919,6 +1006,7 @@ class QAMDemodulator extends EventEmitter {
       }
 
       const power = this._powerMeter.update(ii);
+      this._slowPower += (power - this._slowPower) * AGC_SLOW_POWER_ALPHA;
 
       // Update symbolMag — a normalized-units estimate of the RMS magnitude
       // of the carrier in the receive band. Independent of the carrier-
@@ -949,6 +1037,17 @@ class QAMDemodulator extends EventEmitter {
       }
 
       if (this._training === RX_TRAINING.PARKED) continue;
+
+      // AGC re-acquisition: only between AGC lock and the first
+      // NORMAL_OPERATION, within the window, and a bounded number of times.
+      if (this._agcReacquireRatio && this._agcLockPower > 0
+          && !this._reachedNormal
+          && REACQUIRE_STAGES.has(this._training)
+          && this._agcReacquires < AGC_REACQUIRE_MAX
+          && this._totalSamples - this._agcLockSample <= AGC_REACQUIRE_WINDOW_MS * SR / 1000
+          && this._slowPower > this._agcLockPower * this._agcReacquireRatio) {
+        this._restartAcquisition();
+      }
 
       // Drive symbol-strobe pacing from eq_put_step. Decrement by
       // COEFF_SETS each sample; when it crosses 0 we run a half-baud's
@@ -1075,6 +1174,7 @@ class QAMDemodulator extends EventEmitter {
     // independent of the demod's training state; resetting it would
     // create the same flap on the symbolMag side that we just removed
     // from the power-meter side.
+    this._resetAgcReacquire();
     this._equalizerCoefficientReset();
   }
 
