@@ -29,6 +29,9 @@ const config                    = require('../../config');
 const { makeLogger }            = require('../logger');
 const { RtpSession, allocateRtpPort, releaseRtpPort } = require('../rtp/RtpSession');
 const { TelnetProxy }           = require('../telnet/TelnetProxy');
+const { PppDetector }           = require('../ppp/PppDetector');
+const { PppBridge }             = require('../ppp/PppBridge');
+const { natManager }            = require('../ppp/NatManager');
 const { AudioCapture }          = require('../dsp/AudioCapture');
 
 const log = makeLogger('CallSession');
@@ -190,6 +193,7 @@ class CallSession extends EventEmitter {
     this._pool     = opts.modemPool || null;
     this._dsp      = null;   // set by activate() — may need async checkout
     this._telnet   = new TelnetProxy();
+    this._ppp      = null;      // PppBridge, created when a PPP caller is detected
     this._rtpPort  = null;
     this._active   = false;
     this._id       = dialog.callId;
@@ -676,16 +680,68 @@ class CallSession extends EventEmitter {
     let minHoldElapsed = false;
     let attached = false;
 
+    // Data path after the hold. 'telnet' (default when config.ppp is
+    // absent) keeps the original behaviour; 'auto' switches to the PPP
+    // bridge as soon as an LCP frame is seen in the RX stream, otherwise
+    // falls back to TelnetProxy; 'ppp' always uses the PPP bridge.
+    const pppCfg   = config.ppp || {};
+    const dataPath = pppCfg.dataPath || 'telnet';
+    const detector = dataPath === 'telnet' ? null : new PppDetector();
+
     // Temporary RX sink — counts bytes for quiescence tracking but
-    // discards them.
+    // discards them (except for PPP detection).
     const rxSink = (buf) => {
       if (attached) return;          // real path is active now
       lastByteAt = Date.now();
       droppedCount += buf.length;
+      if (detector) {
+        const initial = detector.feed(buf);
+        if (initial) attachPpp('LCP detected', initial);
+      }
     };
     this._dsp.on('data', rxSink);
 
     const attach = (reason) => {
+      if (dataPath === 'ppp') attachPpp(reason, null);
+      else attachTelnet(reason);
+    };
+
+    const attachPpp = (reason, initial) => {
+      if (attached || !this._active) return;
+      attached = true;
+      this._dsp.off('data', rxSink);
+      const waited = Date.now() - startedAt;
+      log.info(`[${this._id}] Post-train hold complete — attaching PPP bridge (${reason}, waited ${waited}ms, dropped ${droppedCount} bytes before PPP)`);
+
+      const bridge = new PppBridge(pppCfg, { tag: this._id });
+      this._ppp = bridge;
+      bridge.on('data', buf => {
+        if (!this._dsp) return;
+        try { this._dsp.write(buf); } catch (_) { /* racing teardown */ }
+      });
+      bridge.on('error', err => {
+        log.error(`[${this._id}] PPP bridge error: ${err.message}`);
+        this.hangup('ppp-error');
+      });
+      // Internet access for the caller while the IP link is up.
+      let natHeld = false;
+      bridge.on('ip-up', () => {
+        const nat = pppCfg.nat || {};
+        if (!nat.enabled || natHeld) return;
+        const subnet = nat.subnet || `${pppCfg.localIp.split('.').slice(0, 3).join('.')}.0/24`;
+        natManager.acquire({ subnet, interface: nat.interface || 'auto' });
+        natHeld = true;   // release even if setup failed; acquire counted it
+      });
+      bridge.on('exit', () => {
+        if (natHeld) { natHeld = false; natManager.release(); }
+        if (this._active) this.hangup('ppp-exit');
+      });
+      bridge.start();
+      if (initial) bridge.write(initial);
+      this._dsp.on('data', buf => bridge.write(buf));
+    };
+
+    const attachTelnet = (reason) => {
       if (attached || !this._active) return;
       attached = true;
       this._dsp.off('data', rxSink);
@@ -768,6 +824,7 @@ class CallSession extends EventEmitter {
     log.info(`[${this._id}] Hanging up (reason: ${reason})`);
 
     this._telnet.disconnect();
+    if (this._ppp) this._ppp.stop();
 
     /* Send BYE now (doesn't depend on DSP/VM state), then run the
      * async teardown path which captures dumps before tearing
@@ -787,6 +844,7 @@ class CallSession extends EventEmitter {
     log.info(`[${this._id}] BYE received`);
     this._active = false;
     this._telnet.disconnect();
+    if (this._ppp) this._ppp.stop();
     this._finalizeTeardown('bye');
   }
 
