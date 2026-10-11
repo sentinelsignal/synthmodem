@@ -28,23 +28,24 @@ class FakeRes extends EventEmitter {
     this.writableLength = 0; this._onWrite = onWrite || (() => {});
     this.socket = { setNoDelay: () => { this.noDelay = true; } };
   }
-  write(c) { this.chunks.push(Buffer.from(c)); this._onWrite(c); return true; }
+  // The first write also carries the HTTP status line + headers.
+  write(c) { this._onWrite(c, this.chunks.length === 0); this.chunks.push(Buffer.from(c)); return true; }
   end(c) { if (c) this.write(c); this.ended = true; }
   destroy() { this.destroyed = true; this.emit('close'); }
   get body() { return Buffer.concat(this.chunks); }
 }
 
 /** Modem queue model + fake clock + manual timers. */
-function rig({ bps = 1200, mtu = 296, ...opts } = {}) {
+function rig({ bps = 1200, mtu = 296, queueCapBytes = 560, ...opts } = {}) {
   const m = { t: 0, backlog: 0, maxBacklog: 0, wireTotal: 0, timerOn: false };
   const rate = bps / 11;
   const pacer = new LinkPacer({
-    backlog: () => m.backlog, bps: () => bps, mtu, now: () => m.t,
+    backlog: () => m.backlog, bps: () => bps, mtu, queueCapBytes, now: () => m.t,
     timers: { setInterval: () => { m.timerOn = true; return 1; }, clearInterval: () => { m.timerOn = false; } },
     ...opts,
   });
-  const onWrite = c => {
-    const w = wireBytes(c.length);
+  const onWrite = (c, first) => {
+    const w = wireBytes(c.length) + (first ? 160 : 0);   // ~HTTP headers on the first segment(s)
     m.backlog += w; m.wireTotal += w;
     m.maxBacklog = Math.max(m.maxBacklog, m.backlog);
   };
@@ -151,6 +152,77 @@ test('two responses are interleaved and both complete intact', async () => {
   await Promise.all([da, db]);
   assert.ok(a.body.equals(ba) && b.body.equals(bb));
   assert.ok(order.slice(0, 4).includes('a') && order.slice(0, 4).includes('b'), `order ${order.join('')}`);
+});
+
+// ─── Segment size and queue cap ───────────────────────────────────────────
+
+test('chunk fills a whole TCP segment: 256 B at MTU 296, 244 B if timestamps are in use', () => {
+  assert.equal(new LinkPacer({ backlog: () => 0, bps: () => 2400 }).chunkBytes, 256);
+  assert.equal(new LinkPacer({ backlog: () => 0, bps: () => 2400, tcpOptionsBytes: 12 }).chunkBytes, 244);
+  assert.equal(new LinkPacer({ backlog: () => 0, bps: () => 2400, mtu: 576 }).chunkBytes, 536);
+});
+
+test('queue cap at 2400 bps: paced data never pushes the modem queue past the cap', async () => {
+  const r = rig({ bps: 2400, queueCapBytes: 560 });
+  const res = r.res(); const d = r.pacer.send(res, body(6000));
+  r.run(600000, () => res.ended);
+  await d;
+  assert.ok(r.m.maxBacklog <= 560, `peak ${Math.round(r.m.maxBacklog)} B`);
+});
+
+test('without the cap the first chunk (headers + data) can overflow the 600 B shaper at 2400 bps', async () => {
+  const r = rig({ bps: 2400, queueCapBytes: Infinity });
+  r.m.backlog = 210;                                  // just under the 1 s gate
+  const res = r.res(); const d = r.pacer.send(res, body(6000));
+  r.run(600000, () => res.ended);
+  await d;
+  assert.ok(r.m.maxBacklog > 600, `peak ${Math.round(r.m.maxBacklog)} B — the cap is what prevents this`);
+});
+
+test('a cap smaller than one chunk cannot deadlock: writes proceed when the queue is empty', async () => {
+  const r = rig({ bps: 2400, queueCapBytes: 100 });
+  const res = r.res(); const d = r.pacer.send(res, body(2000));
+  r.run(600000, () => res.ended);
+  assert.deepEqual(await d, { ok: true, reason: 'complete' });
+});
+
+// ─── Measurement log ──────────────────────────────────────────────────────
+
+function capture() {
+  const lines = [];
+  return { lines, logger: { info: m => lines.push(['info', m]), warn: m => lines.push(['warn', m]) } };
+}
+
+test('measurement: one line per completed response with bytes, time, rate, chunks and queue peak', async () => {
+  const { lines, logger } = capture();
+  const r = rig({ bps: 2400, logger });
+  const res = r.res(); const d = r.pacer.send(res, body(4000));
+  r.run(600000, () => res.ended);
+  await d;
+  assert.equal(lines.length, 1);
+  const [level, msg] = lines[0];
+  assert.equal(level, 'info');
+  const m = msg.match(/^paced response complete: 4000\/4000 B written in ([\d.]+) s \((\d+) B\/s, (\d+)% of 2400 bps line\), (\d+) chunks, modem queue peak (\d+) B$/);
+  assert.ok(m, msg);
+  assert.equal(Number(m[4]), Math.ceil(4000 / 256));
+  assert.ok(Number(m[5]) > 0 && Number(m[5]) <= Math.ceil(r.m.maxBacklog), `peak ${m[5]} vs model ${r.m.maxBacklog}`);
+});
+
+test('measurement: client close is logged as info, stalls as a warning, both with progress', async () => {
+  const { lines, logger } = capture();
+  const r = rig({ bps: 1200, logger, stallMs: 5000 });
+  const a = r.res(); const da = r.pacer.send(a, body(5000));
+  r.run(3000);
+  a.emit('close');
+  await da;
+  const b = r.res(); const db = r.pacer.send(b, body(5000));
+  r.m.backlog = 99999;
+  for (let k = 0; k < 200; k++) { r.m.t += 50; r.pacer.tick(); }
+  await db;
+  assert.equal(lines[0][0], 'info');
+  assert.match(lines[0][1], /^paced response closed by client: \d+\/5000 B written/);
+  assert.equal(lines[1][0], 'warn');
+  assert.match(lines[1][1], /^paced response aborted \(stalled\): \d+\/5000 B written/);
 });
 
 // ─── Bounds and cleanup ───────────────────────────────────────────────────

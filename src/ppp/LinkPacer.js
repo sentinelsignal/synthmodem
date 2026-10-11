@@ -31,7 +31,6 @@ const log = makeLogger('LinkPacer');
 
 const BITS_PER_BYTE    = 11;    // QAMModulator UART framing: start + 8 + 2 stop
 const TCPIP_HEADER     = 40;    // IPv4 + TCP, no VJ compression
-const TCP_OPTIONS_SLACK = 12;   // timestamps, if negotiated
 const PPP_FRAMING      = 6;     // flag + address/control + protocol + FCS (worst case)
 const HTTP_HEADER_EST  = 160;   // response status line + headers
 
@@ -47,19 +46,27 @@ class LinkPacer {
    * @param {function} opts.backlog       () → bytes waiting in the modem
    * @param {function} opts.bps           () → negotiated bit rate (falls back to 1200)
    * @param {number}   [opts.mtu=296]     PPP MTU; chunk = one MSS
+   * @param {number}   [opts.tcpOptionsBytes=0]  per-segment TCP options (12 if the
+   *     peer negotiates timestamps); a Dreamcast uses none, so a full
+   *     MTU − 40 byte chunk fills each segment
    * @param {number}   [opts.maxBacklogSec=1.0]
+   * @param {number}   [opts.queueCapBytes=Infinity]  never let backlog + chunk exceed
+   *     this; set just below PppTxShaper's limit so paced data is never dropped
    * @param {number}   [opts.tickMs=50]
    * @param {number}   [opts.stallMs=60000]
    * @param {number}   [opts.maxDurationMs=900000]
    * @param {number}   [opts.maxStreams=8]
    * @param {function} [opts.now]         clock (tests)
    * @param {object}   [opts.timers]      { setInterval, clearInterval } (tests)
+   * @param {object}   [opts.logger]      { info, warn } (tests)
    */
   constructor(opts) {
     this._backlog = opts.backlog;
     this._bps = opts.bps;
-    this._chunk = Math.max(64, (opts.mtu || 296) - TCPIP_HEADER - TCP_OPTIONS_SLACK);
+    this._chunk = Math.max(64, (opts.mtu || 296) - TCPIP_HEADER - (opts.tcpOptionsBytes || 0));
+    this._log = opts.logger || log;
     this._maxBacklogSec = opts.maxBacklogSec ?? 1.0;
+    this._queueCap = opts.queueCapBytes ?? Infinity;
     this._tickMs = opts.tickMs ?? 50;
     this._stallMs = opts.stallMs ?? 60000;
     this._maxDurationMs = opts.maxDurationMs ?? 900000;
@@ -92,14 +99,15 @@ class LinkPacer {
     return new Promise(resolve => {
       if (this._stopped || this._streams.length >= this._maxStreams) {
         const reason = this._stopped ? 'stopped' : 'too-many-streams';
-        log.warn(`refusing paced response: ${reason}`);
+        this._log.warn(`refusing paced response: ${reason}`);
         res.destroy();
         this.stats.aborted++;
         resolve({ ok: false, reason });
         return;
       }
       const now = this._now();
-      const s = { res, body, off: 0, first: true, started: now, progress: now, resolve, done: false };
+      const s = { res, body, size: body.length, off: 0, first: true, chunks: 0, peak: 0,
+                  started: now, progress: now, resolve, done: false };
       const onClose = () => { if (!s.done) this._finish(s, false, 'client-closed'); };
       s.onClose = onClose;
       res.on('close', onClose);
@@ -122,6 +130,7 @@ class LinkPacer {
 
     const backlog = this._backlog() || 0;
     if (backlog > this.stats.maxBacklog) this.stats.maxBacklog = backlog;
+    for (const s of this._streams) if (backlog > s.peak) s.peak = backlog;
 
     // Abort stalled or overlong transfers.
     for (const s of [...this._streams]) {
@@ -137,6 +146,9 @@ class LinkPacer {
         const size = Math.min(this._chunk, s.body.length - s.off);
         const cost = wireBytes(size) + (s.first ? HTTP_HEADER_EST : 0);
         if (this._tokens < cost) break;
+        // Would overflow the shaper — wait, unless the queue is empty (a chunk
+        // larger than the cap must still be able to go, or nothing ever would).
+        if (backlog > 0 && backlog + cost > this._queueCap) break;
         this._tokens -= cost;
         this._rr = (this._rr + n + 1) % Math.max(1, this._streams.length);
         this._write(s, size, now);
@@ -151,6 +163,7 @@ class LinkPacer {
     s.off += size;
     s.first = false;
     s.progress = now;
+    s.chunks++;
     this.stats.bytes += size;
     this.stats.chunks++;
     if (s.off >= s.body.length) {
@@ -167,10 +180,20 @@ class LinkPacer {
     const i = this._streams.indexOf(s);
     if (i >= 0) this._streams.splice(i, 1);
     s.res.removeListener('close', s.onClose);
-    if (ok) this.stats.completed++;
-    else {
+    // One measurement line per response. "written" = handed to TCP; the
+    // modem still has up to ~1 s of it queued at that point.
+    const secs = Math.max(0.001, (this._now() - s.started) / 1000);
+    const bps = Number(this._bps()) || 1200;
+    const measure = `${s.off}/${s.size} B written in ${secs.toFixed(1)} s ` +
+      `(${Math.round(s.off / secs)} B/s, ${Math.round(s.off / secs / (bps / BITS_PER_BYTE) * 100)}% of ${bps} bps line), ` +
+      `${s.chunks} chunks, modem queue peak ${Math.round(s.peak)} B`;
+    if (ok) {
+      this.stats.completed++;
+      this._log.info(`paced response complete: ${measure}`);
+    } else {
       this.stats.aborted++;
-      if (reason !== 'client-closed') log.warn(`aborting paced response (${reason}) after ${s.off}/${s.body.length} B`);
+      if (reason === 'client-closed') this._log.info(`paced response closed by client: ${measure}`);
+      else this._log.warn(`paced response aborted (${reason}): ${measure}`);
       if (!s.res.destroyed) s.res.destroy();
     }
     s.body = null;                  // release the buffer promptly

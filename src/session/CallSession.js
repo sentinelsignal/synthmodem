@@ -755,6 +755,9 @@ class CallSession extends EventEmitter {
             backlog: () => (this._dsp && this._dsp.txBacklogBytes) || 0,
             bps: () => (this._connectInfo && this._connectInfo.bps) || 1200,
             mtu: pppCfg.mtu || 296,
+            tcpOptionsBytes: gw.tcpOptionsBytes || 0,
+            // Stay under PppTxShaper's drop threshold so paced data is never dropped.
+            queueCapBytes: (pppCfg.txQueueBytes ?? 600) - 40,
           });
         }
         dnsResponder = new DnsResponder({

@@ -44,6 +44,34 @@ function frameProtocol(seg) {
   return (head[i] << 8) | head[i + 1];
 }
 
+/**
+ * Short description of an async-HDLC frame body (escaped, no flags) for
+ * the drop log, e.g. "TCP 192.168.51.1:80→:1034 seq=710038375 len=244
+ * [ACK,PSH] (295 B)". Only used when a frame is dropped.
+ */
+function describeFrame(seg) {
+  const f = [];
+  for (let i = 0; i < seg.length; i++) f.push(seg[i] === 0x7d && i + 1 < seg.length ? seg[++i] ^ 0x20 : seg[i]);
+  const wire = `(${seg.length + 1} B)`;
+  let i = (f[0] === 0xff && f[1] === 0x03) ? 2 : 0;
+  let proto = f[i];
+  if (proto & 1) i += 1; else { proto = (f[i] << 8) | f[i + 1]; i += 2; }
+  if (proto !== 0x21) return `proto 0x${proto.toString(16)} ${wire}`;
+  const ip = Buffer.from(f.slice(i, f.length - 2));         // strip FCS
+  if (ip.length < 20) return `IP (truncated) ${wire}`;
+  const ihl = (ip[0] & 0x0f) * 4, p = ip[9], src = [...ip.subarray(12, 16)].join('.');
+  const seg4 = ip.subarray(ihl);
+  if (p === 6 && seg4.length >= 20) {
+    const doff = (seg4[12] >> 4) * 4, len = ip.readUInt16BE(2) - ihl - doff;
+    const flags = ['FIN', 'SYN', 'RST', 'PSH', 'ACK'].filter((_, k) => seg4[13] & (1 << k)).join(',');
+    return `TCP ${src}:${seg4.readUInt16BE(0)}→:${seg4.readUInt16BE(2)} seq=${seg4.readUInt32BE(4)} len=${len} [${flags}] ${wire}`;
+  }
+  if (p === 17 && seg4.length >= 8) return `UDP ${src}:${seg4.readUInt16BE(0)}→:${seg4.readUInt16BE(2)} ${wire}`;
+  return `IP proto ${p} ${wire}`;
+}
+
+const MAX_DROP_DETAILS = 5;    // per report line
+
 class PppTxShaper {
   /**
    * @param {object} opts
@@ -51,12 +79,15 @@ class PppTxShaper {
    * @param {function} opts.backlog     () → bytes queued in the modem
    * @param {number}   [opts.limitBytes=600]
    * @param {function} [opts.now]       clock (tests)
+   * @param {object}   [opts.logger]    { info } (tests)
    */
-  constructor({ write, backlog, limitBytes = 600, now = Date.now }) {
+  constructor({ write, backlog, limitBytes = 600, now = Date.now, logger = log }) {
     this._write = write;
     this._backlog = backlog;
     this._limit = limitBytes;
     this._now = now;
+    this._log = logger;
+    this._dropDetails = [];
     this._buf = Buffer.alloc(0);
     this.stats = { frames: 0, dropped: 0, droppedBytes: 0 };
     this._lastReport = now();
@@ -87,9 +118,16 @@ class PppTxShaper {
     const control = proto === null || proto >= 0x4000;
     if (!control) {
       const limit = seg.length <= SMALL_FRAME ? this._limit * 2 : this._limit;
-      if (this._backlog() + seg.length > limit) {
+      const backlog = this._backlog();
+      if (backlog + seg.length > limit) {
         this.stats.dropped++;
         this.stats.droppedBytes += seg.length;
+        if (this._dropDetails.length < MAX_DROP_DETAILS) {
+          let what;
+          try { what = describeFrame(seg.subarray(0, seg.length - 1)); }
+          catch (_) { what = `frame (${seg.length} B)`; }
+          this._dropDetails.push(`${what} at backlog ${backlog} B`);
+        }
         return;
       }
     }
@@ -99,10 +137,13 @@ class PppTxShaper {
   _report() {
     const t = this._now();
     if (t - this._lastReport < REPORT_MS || this.stats.dropped === this._reportedDrops) return;
-    log.info(`PPP TX: dropped ${this.stats.dropped - this._reportedDrops} frame(s) to keep the modem queue short (backlog ${this._backlog()} B, total dropped ${this.stats.dropped}/${this.stats.frames})`);
+    const n = this.stats.dropped - this._reportedDrops;
+    const more = n > this._dropDetails.length ? `; +${n - this._dropDetails.length} more` : '';
+    this._log.info(`PPP TX: dropped ${n} frame(s) to keep the modem queue short (backlog ${this._backlog()} B, total dropped ${this.stats.dropped}/${this.stats.frames}) — ${this._dropDetails.join('; ')}${more}`);
     this._lastReport = t;
     this._reportedDrops = this.stats.dropped;
+    this._dropDetails = [];
   }
 }
 
-module.exports = { PppTxShaper, frameProtocol };
+module.exports = { PppTxShaper, frameProtocol, describeFrame };

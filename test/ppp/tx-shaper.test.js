@@ -9,7 +9,7 @@ const { test } = require('node:test');
 const config = require('../../config');
 config.logging.level = 'error';
 
-const { PppTxShaper, frameProtocol } = require('../../src/ppp/PppTxShaper');
+const { PppTxShaper, frameProtocol, describeFrame } = require('../../src/ppp/PppTxShaper');
 const { buildPppdArgs } = require('../../src/ppp/PppBridge');
 const { QAMModulator, V22bis } = require('../../src/dsp/protocols/V22');
 const { HandshakeEngine } = require('../../src/dsp/Handshake');
@@ -137,6 +137,49 @@ test('simulation: TCP-sized burst into a 1200 bps modem keeps the queue bounded'
   assert.equal(out.filter(f => f.readUInt16BE(2) === 0xc021).length, lcpSent, 'every LCP frame delivered');
   for (const f of out) assert.equal(fcs16(f), 0xf0b8);
   assert.ok(s.stats.dropped > 0.8 * 600, `dropped ${s.stats.dropped}/600 IP frames`);
+});
+
+// ─── drop details ─────────────────────────────────────────────────────────
+
+/** IPv4/TCP (or UDP) packet: 192.168.51.1:sport → 192.168.51.2:dport. */
+function ipPacket({ proto = 6, sport = 80, dport = 1034, seq = 710038375, flags = 0x18, payload = 244 } = {}) {
+  const l4len = proto === 6 ? 20 : 8;
+  const ip = Buffer.alloc(20 + l4len + payload, 0x41);
+  ip[0] = 0x45; ip.writeUInt16BE(ip.length, 2); ip[8] = 64; ip[9] = proto;
+  Buffer.from([192, 168, 51, 1]).copy(ip, 12); Buffer.from([192, 168, 51, 2]).copy(ip, 16);
+  ip.writeUInt16BE(sport, 20); ip.writeUInt16BE(dport, 22);
+  if (proto === 6) { ip.writeUInt32BE(seq, 24); ip.writeUInt32BE(0, 28); ip[32] = 0x50; ip[33] = flags; }
+  else ip.writeUInt16BE(8 + payload, 24);
+  return ip;
+}
+const body = f => f.subarray(1, f.length - 1);
+
+test('describeFrame: TCP with ports, seq, payload length and flags; UDP; non-IP', () => {
+  const tcp = hdlc(0x0021, ipPacket().subarray(0));
+  const d = describeFrame(body(tcp));
+  assert.match(d, /^TCP 192\.168\.51\.1:80→:1034 seq=710038375 len=244 \[PSH,ACK\] \(\d+ B\)$/);
+  assert.match(describeFrame(body(hdlc(0x0021, ipPacket({ proto: 17, sport: 53, dport: 2058, payload: 50 })))), /^UDP 192\.168\.51\.1:53→:2058/);
+  assert.match(describeFrame(body(LCP())), /^proto 0xc021/);
+  // proto field without the IP layer: the packet arrives as raw bytes via hdlc(0x21,…)
+  assert.match(describeFrame(body(hdlc(0x21, ipPacket({ payload: 10 }), { acfc: true }))), /^TCP .* len=10 /);
+});
+
+test('drop report names the dropped frames (max 5 + count of the rest) and resets per report', () => {
+  const lines = [];
+  let t = 0;
+  const s = new PppTxShaper({ write: () => {}, backlog: () => 700, limitBytes: 600, now: () => t, logger: { info: m => lines.push(m) } });
+  for (let k = 0; k < 7; k++) s.push(hdlc(0x0021, ipPacket({ seq: 1000 + k * 244 })));
+  t = 11000; s.push(Buffer.from([0x7e]));
+  assert.equal(lines.length, 1);
+  assert.match(lines[0], /dropped 7 frame\(s\)/);
+  assert.equal((lines[0].match(/TCP 192\.168\.51\.1:80→:1034 seq=\d+ len=244/g) || []).length, 5);
+  assert.match(lines[0], /seq=1000 len=244 .* at backlog 700 B/);
+  assert.match(lines[0], /; \+2 more$/);
+  s.push(hdlc(0x0021, ipPacket({ seq: 9999 })));
+  t = 22000; s.push(Buffer.from([0x7e]));
+  assert.equal(lines.length, 2);
+  assert.match(lines[1], /dropped 1 frame\(s\).*seq=9999/);
+  assert.ok(!lines[1].includes('+'), 'details reset between reports');
 });
 
 // ─── modem backlog reporting ──────────────────────────────────────────────

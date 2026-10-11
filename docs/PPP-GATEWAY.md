@@ -78,6 +78,8 @@ SynthModem behaves as before (telnet menu only).
       maxImageBytes: 8192,
       timeoutMs:     15000,
       pacing:        true,       // pace responses to the modem rate (LinkPacer)
+      tcpOptionsBytes: 0,        // per-segment TCP options; 12 if the client uses timestamps
+                                 // (a Dreamcast does not), so chunks fill whole segments
     },
 
     // Internet routing for the caller (IP forwarding + pf NAT). Changes macOS
@@ -113,5 +115,14 @@ SynthModem behaves as before (telnet menu only).
 
 - `logs/pppd-*.log` — LCP/IPCP negotiation per call.
 - SynthModem log: `IP link up`, `DNS …`, `GET … → 200 … B`, `POP3 …`
-  (passwords are never logged), `PPP TX: dropped …` (should be rare with
-  pacing on).
+  (passwords are never logged).
+- `paced response complete: 3954/3954 B written in 21.2 s (187 B/s, 86% of
+  2400 bps line), 16 chunks, modem queue peak 467 B` — one line per web
+  response. "Written" means handed to TCP; the modem still has up to ~1 s
+  of it queued at that point. Aborted or client-closed responses log the
+  same fields.
+- `PPP TX: dropped N frame(s) … — TCP 192.168.51.1:80→:1034 seq=… len=256
+  [PSH,ACK] (… B) at backlog … B; …` — the shaper's safety net, with up to
+  five dropped frames described per 10 s. Should be rare: the pacer keeps
+  its own data below the drop threshold, so drops are mostly spurious TCP
+  retransmissions.
