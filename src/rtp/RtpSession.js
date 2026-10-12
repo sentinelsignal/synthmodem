@@ -52,15 +52,30 @@ class RtpSession extends EventEmitter {
    *    connection stability. The tradeoff is fixed added latency equal
    *    to `jitterBufferInitDepth × packetIntervalMs` (e.g. 40 × 20ms
    *    = 800ms), which is imperceptible for modem protocols.
+   *    Because it releases at most one packet per timer tick, any late
+   *    tick or event-loop stall adds latency permanently; measured on
+   *    live calls this grows ~0.5–1 s per minute, and far more when the
+   *    timer is throttled.
+   *
+   * 'ordered' — in-order delivery with no fixed delay, for the native DSP
+   *    (whose receiver works on the sample stream, not wall-clock time).
+   *    Each packet is emitted the moment it is the next in sequence; a
+   *    packet after a gap is held up to `orderedReorderWaitMs` (default
+   *    60ms) for the missing one, then the gap is skipped. Late and
+   *    duplicate packets are dropped; no concealment is ever emitted.
+   *    Latency cannot accumulate: after any stall, everything queued is
+   *    delivered at once. Holding is bounded by `orderedMaxHeld` packets
+   *    (default 50 = 1s), beyond which the gap is skipped immediately.
    */
   constructor(opts = {}) {
     super();
     this._playoutMode  = opts.playoutMode || 'buffered';
     if (this._playoutMode !== 'buffered' &&
         this._playoutMode !== 'immediate' &&
-        this._playoutMode !== 'fixed-buffered') {
+        this._playoutMode !== 'fixed-buffered' &&
+        this._playoutMode !== 'ordered') {
       throw new TypeError(
-        `RtpSession: playoutMode must be 'buffered', 'immediate', or 'fixed-buffered', got ${this._playoutMode}`);
+        `RtpSession: playoutMode must be 'buffered', 'immediate', 'fixed-buffered' or 'ordered', got ${this._playoutMode}`);
     }
     this._socket       = null;
     this._localPort    = null;
@@ -83,6 +98,11 @@ class RtpSession extends EventEmitter {
 
     this._running      = false;
     this._silenceCount = 0;
+
+    // 'ordered' playout state (see constructor doc).
+    this._ordNext   = null;     // next sequence number to deliver
+    this._ordTimer  = null;     // gap timeout
+    this._ordStats  = { delivered: 0, late: 0, lost: 0, gaps: 0, maxHeld: 0, resyncs: 0 };
 
     // Optional TX timing trace for diagnostics. Records the wall-clock
     // ns timestamp of every send() call, plus the RTP sequence number,
@@ -170,6 +190,13 @@ class RtpSession extends EventEmitter {
   close() {
     this._running = false;
     if (this._jitterTimer) { clearInterval(this._jitterTimer); this._jitterTimer = null; }
+    if (this._ordTimer) { clearTimeout(this._ordTimer); this._ordTimer = null; }
+    if (this._playoutMode === 'ordered' && this._ordStats.delivered) {
+      const s = this._ordStats;
+      log.info(`RTP ordered playout: delivered ${s.delivered}, late/duplicate ${s.late}, ` +
+               `lost ${s.lost} in ${s.gaps} gap(s), max held ${s.maxHeld}, resyncs ${s.resyncs}`);
+    }
+    this._jitterBuf.clear();
     if (this._socket) {
       this._socket.close();
       this._socket = null;
@@ -219,6 +246,11 @@ class RtpSession extends EventEmitter {
     // isn't as bad for a modem as a silence frame.
     if (this._playoutMode === 'immediate') {
       this._deliverAudio(payload, pt);
+      return;
+    }
+
+    if (this._playoutMode === 'ordered') {
+      this._orderedInsert(seq, payload, pt);
       return;
     }
 
@@ -346,6 +378,69 @@ class RtpSession extends EventEmitter {
     const samples = this._tsIncrement | 0;
     this.emit('audio', new Float32Array(samples));
   }
+
+  // ─── 'ordered' playout ─────────────────────────────────────────────────────
+
+  _orderedInsert(seq, payload, pt) {
+    if (this._ordNext === null) this._ordNext = seq;
+    const d = (((seq - this._ordNext) & 0xffff) << 16) >> 16;   // signed 16-bit distance
+    if (d < 0) { this._ordStats.late++; return; }                // already played or skipped
+    if (d > cfg.maxSeqGap) {
+      // Far ahead of where we are: the stream restarted or a long outage.
+      // Drop what is held and continue from here.
+      log.warn(`RTP ordered playout: seq jump ${this._ordNext} → ${seq}, resyncing`);
+      this._ordStats.resyncs++;
+      this._jitterBuf.clear();
+      this._ordNext = seq;
+    }
+    if (this._jitterBuf.has(seq)) { this._ordStats.late++; return; }   // duplicate
+    this._jitterBuf.set(seq, { payload, pt });
+    this._orderedDrain();
+  }
+
+  /** Deliver everything contiguous from _ordNext; arm the gap timer if blocked. */
+  _orderedDrain() {
+    let progressed = false;
+    for (;;) {
+      const p = this._jitterBuf.get(this._ordNext);
+      if (!p) break;
+      this._jitterBuf.delete(this._ordNext);
+      this._ordNext = (this._ordNext + 1) & 0xffff;
+      this._ordStats.delivered++;
+      progressed = true;
+      this._deliverAudio(p.payload, p.pt);
+    }
+    const held = this._jitterBuf.size;
+    if (held > this._ordStats.maxHeld) this._ordStats.maxHeld = held;
+    if (held === 0 || progressed) {
+      if (this._ordTimer) { clearTimeout(this._ordTimer); this._ordTimer = null; }
+      if (held === 0) return;
+    }
+    // Packets are waiting behind a gap.
+    const maxHeld = cfg.orderedMaxHeld ?? 50;
+    if (held > maxHeld) { this._orderedSkipGap(); return; }
+    if (!this._ordTimer) {
+      this._ordTimer = setTimeout(() => { this._ordTimer = null; this._orderedSkipGap(); },
+                                  cfg.orderedReorderWaitMs ?? 60);
+    }
+  }
+
+  /** Give up on the missing packet(s): jump to the earliest held one. */
+  _orderedSkipGap() {
+    if (!this._jitterBuf.size) return;
+    let nearest = null, delta = Infinity;
+    for (const k of this._jitterBuf.keys()) {
+      const d = (((k - this._ordNext) & 0xffff) << 16) >> 16;
+      if (d > 0 && d < delta) { delta = d; nearest = k; }
+    }
+    if (nearest === null) { this._jitterBuf.clear(); return; }
+    this._ordStats.lost += delta;
+    this._ordStats.gaps++;
+    this._ordNext = nearest;
+    this._orderedDrain();
+  }
+
+  get playoutStats() { return { ...this._ordStats, held: this._jitterBuf.size }; }
 
   _deliverAudio(payload, pt) {
     // Determine codec from PT

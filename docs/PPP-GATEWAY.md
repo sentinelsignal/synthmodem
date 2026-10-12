@@ -101,6 +101,28 @@ SynthModem behaves as before (telnet menu only).
   },
 ```
 
+### RTP receive playout
+
+Set the native backend's receive playout to `'ordered'`:
+
+```js
+  rtp: {
+    // ...
+    playoutMode: 'ordered',
+  },
+```
+
+`'fixed-buffered'` (D-Modem style) starts with an 800 ms buffer and
+releases at most one packet per 20 ms timer tick, so every late tick or
+event-loop stall adds delay permanently — measured on live calls at
+~0.5–1 s per minute, and far more when timers are throttled; past 10 s it
+starts discarding packets. PPP and TCP pay that delay on every round trip.
+`'ordered'` delivers each packet as soon as it is next in sequence (the
+native DSP works on the sample stream, not wall-clock time), holds a gap
+up to 60 ms for reordering, then skips it. Optional tuning:
+`rtp.orderedReorderWaitMs` (default 60) and `rtp.orderedMaxHeld` (default
+50 packets).
+
 ## Dreamcast notes
 
 - Its stored ISP settings may contain DNS servers of a defunct provider; it
