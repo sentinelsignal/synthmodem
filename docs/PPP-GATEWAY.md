@@ -73,7 +73,9 @@ SynthModem behaves as before (telnet menu only).
       httpPort:      80,
       pop3Port:      110,        // empty-mailbox stub; null = off
       dnsOverrides:  {},         // e.g. { '*.example.com': '203.0.113.5' }
-      localHosts:    ['www.sega.com', 'vserver.planetweb.com'],   // → local start page
+      // → local start page; '*.example.com' matches example.com and subdomains.
+      // PlanetWeb's startup hosts seen live: vserver.planetweb.com, dreamcast.planetweb.com
+      localHosts:    ['www.sega.com', '*.planetweb.com'],
       maxPageBytes:  16384,      // ~2.5 min at 1200 bit/s
       maxImageBytes: 8192,
       timeoutMs:     15000,

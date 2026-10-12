@@ -116,6 +116,21 @@ function charsetOf(contentType) {
   return m ? m[1].toLowerCase() : 'utf-8';
 }
 
+/**
+ * True if `host` matches one of `patterns`: an exact name, or '*.domain'
+ * which matches the domain itself and any subdomain (same rule as
+ * DnsResponder overrides). Case-insensitive.
+ */
+function matchesHost(host, patterns) {
+  const h = String(host).toLowerCase();
+  return (patterns || []).some(p => {
+    const pat = String(p).toLowerCase();
+    if (!pat.startsWith('*.')) return h === pat;
+    const base = pat.slice(2);
+    return h === base || h.endsWith('.' + base);
+  });
+}
+
 // ─── Local pages ──────────────────────────────────────────────────────────
 
 function startPage() {
@@ -149,7 +164,8 @@ class WebGateway extends EventEmitter {
    * @param {string}   opts.bindIp
    * @param {number}   [opts.port=80]
    * @param {string[]} opts.allowedClients   caller address(es)
-   * @param {string[]} [opts.localHosts]     names served the start page
+   * @param {string[]} [opts.localHosts]     names served the start page; '*.example.com'
+   *                                          matches example.com and any subdomain
    * @param {number}   [opts.maxPageBytes=16384]
    * @param {number}   [opts.maxImageBytes=8192]
    * @param {number}   [opts.timeoutMs=15000]
@@ -228,7 +244,7 @@ class WebGateway extends EventEmitter {
     const host = url.hostname.toLowerCase();
     const urlPort = url.port === '' ? 80 : Number(url.port);
     const isGateway = host === this._opts.bindIp && (urlPort === this.port || url.port === '');
-    if (isGateway || this._opts.localHosts.includes(host)) {
+    if (isGateway || matchesHost(host, this._opts.localHosts)) {
       log.info(`${req.method} ${url.href} → start page`);
       return this._send(res, 200, 'text/html; charset=ISO-8859-1', toLatin1(startPage()));
     }
@@ -328,4 +344,4 @@ function readBody(req, limit) {
   });
 }
 
-module.exports = { WebGateway, isPrivateAddress, simplifyHtml, toLatin1, capPage, startPage };
+module.exports = { WebGateway, isPrivateAddress, simplifyHtml, toLatin1, capPage, startPage, matchesHost };

@@ -20,7 +20,7 @@ config.modem.backend = 'native';
 config.modem.captureAudio = false;
 
 const { DnsResponder, buildResponse, matchOverride } = require('../../src/ppp/DnsResponder');
-const { WebGateway, isPrivateAddress, simplifyHtml, toLatin1, capPage } = require('../../src/ppp/WebGateway');
+const { WebGateway, isPrivateAddress, simplifyHtml, toLatin1, capPage, matchesHost } = require('../../src/ppp/WebGateway');
 
 // ─── DNS helpers ──────────────────────────────────────────────────────────
 
@@ -235,6 +235,24 @@ test('gateway: local hosts and the gateway address get the start page without fe
     }
     assert.equal(fetched, 0);
     assert.ok((await get(gw, { host: 'www.sega.com' })).body.length < 2048, 'start page stays small');
+  } finally { gw.stop(); }
+});
+
+test('gateway: localHosts wildcards — *.planetweb.com covers every PlanetWeb startup host', async () => {
+  const pats = ['www.sega.com', '*.planetweb.com'];
+  for (const h of ['dreamcast.planetweb.com', 'vserver.planetweb.com', 'planetweb.com', 'DreamCast.PlanetWeb.com', 'www.sega.com']) {
+    assert.equal(matchesHost(h, pats), true, h);
+  }
+  for (const h of ['sega.com', 'notplanetweb.com', 'planetweb.com.evil.test', 'x.sega.com', 'www.sega.com.evil']) {
+    assert.equal(matchesHost(h, pats), false, h);
+  }
+  let fetched = 0;
+  const gw = await startGateway({ localHosts: pats, fetchImpl: () => { fetched++; throw new Error('should not fetch'); } });
+  try {
+    const r = await get(gw, { host: 'dreamcast.planetweb.com', pathName: '/' });
+    assert.equal(r.status, 200);
+    assert.ok(r.body.toString('latin1').includes('SynthModem gateway'));
+    assert.equal(fetched, 0);
   } finally { gw.stop(); }
 });
 

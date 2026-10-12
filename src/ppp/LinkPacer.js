@@ -184,9 +184,12 @@ class LinkPacer {
     // modem still has up to ~1 s of it queued at that point.
     const secs = Math.max(0.001, (this._now() - s.started) / 1000);
     const bps = Number(this._bps()) || 1200;
-    const measure = `${s.off}/${s.size} B written in ${secs.toFixed(1)} s ` +
-      `(${Math.round(s.off / secs)} B/s, ${Math.round(s.off / secs / (bps / BITS_PER_BYTE) * 100)}% of ${bps} bps line), ` +
-      `${s.chunks} chunks, modem queue peak ${Math.round(s.peak)} B`;
+    // A rate is only meaningful once pacing has spaced at least two chunks.
+    const rate = s.chunks >= 2
+      ? `(${Math.round(s.off / secs)} B/s, ${Math.round(s.off / secs / (bps / BITS_PER_BYTE) * 100)}% of ${bps} bps line)`
+      : '(in one chunk)';
+    const measure = `${s.off}/${s.size} B written in ${secs.toFixed(1)} s ${rate}, ` +
+      `${s.chunks} chunk${s.chunks === 1 ? '' : 's'}, modem queue peak ${Math.round(s.peak)} B`;
     if (ok) {
       this.stats.completed++;
       this._log.info(`paced response complete: ${measure}`);

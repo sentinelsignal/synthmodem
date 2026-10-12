@@ -208,6 +208,16 @@ test('measurement: one line per completed response with bytes, time, rate, chunk
   assert.ok(Number(m[5]) > 0 && Number(m[5]) <= Math.ceil(r.m.maxBacklog), `peak ${m[5]} vs model ${r.m.maxBacklog}`);
 });
 
+test('measurement: a single-chunk response logs no rate (it is not meaningful)', async () => {
+  const { lines, logger } = capture();
+  const r = rig({ bps: 2400, logger });
+  const res = r.res(); const d = r.pacer.send(res, body(218));
+  r.run(10000, () => res.ended);
+  await d;
+  assert.match(lines[0][1], /^paced response complete: 218\/218 B written in [\d.]+ s \(in one chunk\), 1 chunk, modem queue peak \d+ B$/);
+  assert.ok(!lines[0][1].includes('%'));
+});
+
 test('measurement: client close is logged as info, stalls as a warning, both with progress', async () => {
   const { lines, logger } = capture();
   const r = rig({ bps: 1200, logger, stallMs: 5000 });
